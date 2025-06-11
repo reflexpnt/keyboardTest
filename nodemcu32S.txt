@@ -1,0 +1,709 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Keypad.h>
+#include <HTTPClient.h>
+#include "esp_mac.h" // Para obtener la MAC address
+#include "esp_timer.h"
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h> // Para parsear JSON
+
+// ===============================================
+// CONFIGURACIÓN DE DEBUG
+// ===============================================
+// Descomenta la siguiente línea para habilitar logs de debug del teclado
+//#define DEBUG_KEYPAD
+
+// Descomenta esta línea para que el request se haga cada 20 segundos para debug
+#define DEBUG_20_SEC_REQUEST
+
+const byte ROWS = 4; // Cuatro filas
+const byte COLS = 4; // Cuatro columnas
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+// Pines para las filas (INPUT_PULLUP) - Mejorados para mayor confiabilidad
+byte rowPins[ROWS] = {34, 35, 32, 33}; // 32 y 33 son más confiables que 39 y 36
+
+// Pines para las columnas (OUTPUT) - Tu selección está bien
+byte colPins[COLS] = {25, 26, 27, 14}; 
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+char KEY = 'x';
+
+// ===============================================
+// VARIABLES PARA SISTEMA DE PIN
+// ===============================================
+String inputDigits = "";                           // Almacena los dígitos ingresados (máximo 4)
+bool pinReadyForValidation = false;                // Flag para indicar que hay 4 dígitos listos
+bool pinValidationInProgress = false;              // Flag para indicar validación en progreso
+enum PinValidationResult { PENDING, SUCCESS, FAILED };
+volatile PinValidationResult pinResult = PENDING;
+unsigned long pinResultDisplayTime = 0;           // Tiempo para mostrar resultado
+const unsigned long PIN_RESULT_SHOW_DURATION = 3000; // 3 segundos mostrando resultado
+
+// ===============================================
+// VARIABLES PARA TECLADO OPTIMIZADO
+// ===============================================
+volatile bool keypadReadFlag = false;           // Flag para indicar cuándo leer el teclado
+char lastValidKey = 0;                          // Última tecla válida presionada
+unsigned long lastKeyTime = 0;                  // Tiempo de la última tecla para debounce
+const unsigned long KEY_DEBOUNCE_TIME = 100;    // Tiempo de debounce en miliseconds (aumentado)
+volatile bool httpRequestInProgress = false;    // Flag para debug - indica si HTTP está en progreso
+SemaphoreHandle_t keypadSemaphore;              // Semáforo para proteger variables del teclado
+SemaphoreHandle_t pinSemaphore;                 // Semáforo para proteger variables del PIN
+
+TFT_eSPI tft = TFT_eSPI();
+
+//https://rgbcolorpicker.com/565
+#define WHITE 0xFFFF
+#define BLACK 0x0000
+#define TEXT_COLOR 0xFFFF
+#define GREY_DOTS 0x2108 // Color para las barritas grises
+#define RED 0xF800       
+#define GREEN 0x07E0     // Verde para éxito
+#define BLUE_BAR 0x2258
+#define ORANGE 0xFD20    // Naranja para procesando
+
+// Semáforo para proteger las variables de fecha/hora
+SemaphoreHandle_t dateTimeSemaphore;
+
+// Declaramos una variable global para el color del texto de la hora/fecha
+volatile uint16_t currentTextColor = TEXT_COLOR; // Inicialmente blanco
+
+// Variables para evitar parpadeo - solo redibujar si cambió
+String lastDisplayTime = "";
+String lastDisplayDate = "";
+int lastPinDigitsCount = -1;
+
+// Cadenas para almacenar los componentes de la fecha y hora del servidor
+String serverDayOfWeek = "Cargando"; // ej. "Friday"
+String serverDay = "Da...";                     // ej. "06"
+String serverMonth = "Mes...";    // ej. "06" o "Junio"
+String serverYear = "";                    // ej. "2025"
+String serverHour = "00";                  // ej. "21"
+String serverMinute = "00";                // ej. "00"
+String serverSecond = "00";                // ej. "35" (no se mostrará en display)
+
+volatile bool HTTP_REQUEST_FLAG = false; // Este flag es usado por la tarea HTTP
+String MAC_ADDRESS_STR = "00:00:00:00:00:00"; // Almacenará la MAC real
+String IP_ADDRESS = "0.0.0.0";
+
+#define ONBOARD_LED 2
+#define BUZZER 10
+
+// Configuración de red - ajusta según tu entorno
+String serverAPI_path = "http://192.168.0.47:8000/api/";
+String serverAPI_sufijo = "/checkserver";
+String serverPIN_sufijo = "/validatepin";  // Nuevo endpoint para validar PIN
+const char *WIFI_SSID = "Orange-F05C";
+const char *WIFI_PASSWORD = "FWVDQQUN";   //192.168.0.47
+
+#define TRY_TX_POWER
+
+#ifdef TRY_TX_POWER
+#define TX_POWER WIFI_POWER_17dBm
+#endif
+
+#define TIMEOUT 120000
+
+unsigned long connect_time = 0;
+unsigned long etime = 0;
+unsigned long dottime = 0;
+int count = 0;
+
+// --- Estructura para Tareas de Temporizador ---
+typedef struct {
+    const uint32_t interval_ms;
+    volatile bool flag;
+} TimerTask_t;
+
+// --- Definición de las Tareas de Temporizador ---
+TimerTask_t timer_tasks[] = {
+    {5, false},     // 5ms
+    {10, false},    // 10ms
+    {50, false},    // 50ms - USADO PARA TECLADO (optimizado de 25ms)
+    {100, false},   // 100ms
+    {250, false},   // 250ms
+    {500, false},   // 500ms
+    {1000, false},  // 1 seg (Para refresh del display) - Índice 6
+    {2000, false},  // 2 seg
+    {5000, false},  // 5 seg
+    {20000, false}, // 20 seg (DEBUG para HTTP Request) - Índice 9
+    {600000, false} // 10 minutos (600,000 ms para HTTP Request normal) - Índice 10
+};
+
+const int num_timer_tasks = sizeof(timer_tasks) / sizeof(timer_tasks[0]);
+
+// --- Variables Globales del Timer ---
+esp_timer_handle_t esp_timer_flags_handle = NULL;
+volatile SemaphoreHandle_t semaforoTimerFlags;
+volatile uint32_t TIMER_ISR_COUNTER = 0;
+bool estadoLed = LOW;
+
+// Semáforo para acceso al display TFT
+SemaphoreHandle_t tftSemaphore;
+
+// --- Callback de esp_timer (ISR) ---
+void IRAM_ATTR espTimerCallback(void *arg) {
+    BaseType_t higherPriorityTaskWoken = pdFALSE;
+
+    TIMER_ISR_COUNTER++;
+
+    for (int i = 0; i < num_timer_tasks; i++) {
+        if ((TIMER_ISR_COUNTER % timer_tasks[i].interval_ms) == 0) {
+            timer_tasks[i].flag = true;
+        }
+    }
+    
+    // Activar flag de teclado cada 50ms (optimizado)
+    if ((TIMER_ISR_COUNTER % 50) == 0) {
+        keypadReadFlag = true;
+    }
+    
+    xSemaphoreGiveFromISR(semaforoTimerFlags, &higherPriorityTaskWoken);
+    if (higherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// ===============================================
+// FUNCIÓN PARA AGREGAR DÍGITO AL PIN
+// ===============================================
+void addDigitToPin(char digit) {
+    if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+        // Solo agregar si es un dígito y no hemos alcanzado el máximo
+        if (isDigit(digit) && inputDigits.length() < 4) {
+            inputDigits += digit;
+            
+#ifdef DEBUG_KEYPAD
+            Serial.printf("Dígito agregado: %c, PIN actual: %s (%d/4)\n", 
+                         digit, inputDigits.c_str(), inputDigits.length());
+#endif
+            
+            // Si llegamos a 4 dígitos, preparar para validación
+            if (inputDigits.length() == 4) {
+                pinReadyForValidation = true;
+#ifdef DEBUG_KEYPAD
+                Serial.println("PIN completo - Listo para validación");
+#endif
+            }
+        }
+        xSemaphoreGive(pinSemaphore);
+    }
+}
+
+// ===============================================
+// FUNCIÓN PARA LIMPIAR PIN
+// ===============================================
+void clearPin() {
+    if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+        inputDigits = "";
+        pinReadyForValidation = false;
+        pinValidationInProgress = false;
+        pinResult = PENDING;
+#ifdef DEBUG_KEYPAD
+        Serial.println("PIN limpiado");
+#endif
+        xSemaphoreGive(pinSemaphore);
+    }
+}
+
+// ===============================================
+// FUNCIÓN PARA PROCESAR TECLAS PRESIONADAS
+// ===============================================
+void processKeyPress(char key) {
+    switch(key) {
+        case '1': case '2': case '3':
+        case '4': case '5': case '6':
+        case '7': case '8': case '9':
+        case '0':
+            // Solo procesar dígitos si no estamos en validación
+            if (!pinValidationInProgress && pinResult == PENDING) {
+                addDigitToPin(key);
+            }
+            break;
+            
+        case 'A':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Tecla A - Función especial");
+#endif
+            // TODO: Función especial A
+            break;
+            
+        case 'B':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Tecla B - Función especial");
+#endif
+            // TODO: Función especial B
+            break;
+            
+        case 'C':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Tecla C - Limpiar PIN");
+#endif
+            clearPin(); // C = Clear/Limpiar
+            break;
+            
+        case 'D':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Tecla D - Debug info");
+#endif
+            // D = Debug - mostrar info actual
+            Serial.printf("PIN actual: %s, Longitud: %d\n", inputDigits.c_str(), inputDigits.length());
+            break;
+            
+        case '*':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Asterisco - Borrar último dígito");
+#endif
+            // * = Borrar último dígito
+            if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+                if (inputDigits.length() > 0 && !pinValidationInProgress) {
+                    inputDigits.remove(inputDigits.length() - 1);
+                    pinReadyForValidation = false; // Ya no está listo si borramos
+                }
+                xSemaphoreGive(pinSemaphore);
+            }
+            break;
+            
+        case '#':
+#ifdef DEBUG_KEYPAD
+            Serial.println("Numeral - Forzar validación");
+#endif
+            // # = Forzar validación si tenemos al menos 1 dígito
+            if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+                if (inputDigits.length() > 0 && !pinValidationInProgress) {
+                    // Completar con ceros si es necesario
+                    while (inputDigits.length() < 4) {
+                        inputDigits += "0";
+                    }
+                    pinReadyForValidation = true;
+                }
+                xSemaphoreGive(pinSemaphore);
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// ===============================================
+// TAREA OPTIMIZADA PARA TECLADO
+// ===============================================
+void KeypadTask(void *pvParameters) {
+    Serial.println("KeypadTask iniciada - Lectura optimizada cada 50ms");
+    Serial.println("Esta tarea NO perderá teclas durante HTTP requests");
+    
+    for (;;) {
+        // Verificar si es tiempo de leer el teclado (cada 50ms)
+        if (keypadReadFlag) {
+            keypadReadFlag = false;  // Resetear el flag
+            
+            char key = keypad.getKey();  // Leer tecla del keypad
+            unsigned long currentTime = millis();
+            
+            // Validación y debounce de tecla
+            if (key && key != NO_KEY && key != lastValidKey) {
+                // Verificar que haya pasado suficiente tiempo desde la última tecla (debounce)
+                if (currentTime - lastKeyTime > KEY_DEBOUNCE_TIME) {
+                    // Proteger el acceso a variables compartidas
+                    if (xSemaphoreTake(keypadSemaphore, portMAX_DELAY) == pdTRUE) {
+                        
+#ifdef DEBUG_KEYPAD
+                        Serial.printf("Tecla válida detectada: %c\n", key);
+#endif
+                        
+                        // Procesar la tecla
+                        processKeyPress(key);
+                        
+                        // Actualizar variables de control
+                        lastValidKey = key;
+                        lastKeyTime = currentTime;
+                        
+                        xSemaphoreGive(keypadSemaphore);
+                    }
+                }
+            } 
+            // Reset cuando no hay tecla presionada
+            else if (!key || key == NO_KEY) {
+                // Resetear la última tecla después del tiempo de debounce
+                if (currentTime - lastKeyTime > KEY_DEBOUNCE_TIME) {
+                    if (xSemaphoreTake(keypadSemaphore, portMAX_DELAY) == pdTRUE) {
+                        lastValidKey = 0;  // Permitir que la misma tecla se presione de nuevo
+                        xSemaphoreGive(keypadSemaphore);
+                    }
+                }
+            }
+        }
+        
+        // Ceder control a otras tareas cada 10ms
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// Función para obtener la MAC Address en formato string
+String getMACAddress() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA); // Obtener la MAC de la interfaz Wi-Fi Station
+    return String(mac[0], HEX) + ":" +
+           String(mac[1], HEX) + ":" +
+           String(mac[2], HEX) + ":" +
+           String(mac[3], HEX) + ":" +
+           String(mac[4], HEX) + ":" +
+           String(mac[5], HEX);
+}
+
+void getStatus(void) {
+    switch (WiFi.status()) {
+    case WL_NO_SSID_AVAIL:
+        Serial.println("\n[WiFi] SSID not found");
+        break;
+    case WL_CONNECT_FAILED:
+        Serial.print("\n[WiFi] Failed - WiFi not connected! Reason: ");
+        return;
+        break;
+    case WL_CONNECTION_LOST:
+        Serial.println("\n[WiFi] Connection was lost");
+        break;
+    case WL_SCAN_COMPLETED:
+        Serial.println("\n[WiFi] Scan is completed");
+        break;
+    case WL_DISCONNECTED:
+        Serial.println("\n[WiFi] WiFi is disconnected");
+        break;
+    case WL_CONNECTED:
+        Serial.print("\n[WiFi] WiFi is connected. IP address: ");
+        IP_ADDRESS = WiFi.localIP().toString();
+        Serial.println(IP_ADDRESS);
+        break;
+    default:
+        Serial.print("\n[WiFi] WiFi Status: ");
+        Serial.println(WiFi.status());
+        break;
+    }
+}
+
+void start_connecting_fer(void) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+#ifdef TRY_TX_POWER
+    if (count) {
+        delay(25);
+        if (WiFi.getTxPower() != TX_POWER) {
+            WiFi.setTxPower(TX_POWER);
+            delay(25);
+        }
+    }
+    Serial.printf("Wi-Fi TX power set to: %d\n", WiFi.getTxPower());
+#endif
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("\nConnecting");
+    // Bucle de espera con timeout para la conexión WiFi
+    unsigned long wifi_connect_start_time = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifi_connect_start_time < TIMEOUT)) {
+        delay(500);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        getStatus();
+    } else {
+        Serial.println("\nFailed to connect to WiFi within timeout.");
+    }
+}
+
+// Función para obtener una copia segura de las variables de fecha/hora
+void getDateTimeValues(String &dayOfWeek, String &day, String &month, String &year, String &hour, String &minute) {
+    if (xSemaphoreTake(dateTimeSemaphore, portMAX_DELAY) == pdTRUE) {
+        dayOfWeek = serverDayOfWeek;
+        day = serverDay;
+        month = serverMonth;
+        year = serverYear;
+        hour = serverHour;
+        minute = serverMinute;
+        xSemaphoreGive(dateTimeSemaphore);
+    }
+}
+
+// Función para actualizar las variables de fecha/hora de forma segura
+void setDateTimeValues(const String &dayOfWeek, const String &day, const String &month, const String &year, const String &hour, const String &minute, const String &second) {
+    if (xSemaphoreTake(dateTimeSemaphore, portMAX_DELAY) == pdTRUE) {
+        serverDayOfWeek = dayOfWeek;
+        serverDay = day;
+        serverMonth = month;
+        serverYear = year;
+        serverHour = hour;
+        serverMinute = minute;
+        serverSecond = second;
+        xSemaphoreGive(dateTimeSemaphore);
+    }
+}
+
+// Función para centrar texto correctamente
+int getCenteredX(String text, int font_size) {
+    tft.setTextSize(1); // Temporal para medir
+    int width = tft.textWidth(text, font_size);
+    return (tft.width() - width) / 2;
+}
+
+// ===============================================
+// FUNCIÓN PARA DIBUJAR INDICADORES DE PIN
+// ===============================================
+void drawPinIndicators() {
+    int circle_radius = 4;  // Radio de los círculos
+    int bar_width = 30;     // Ancho de las barras
+    int bar_height = 8;     // Alto de las barras
+    int spacing = 15;       // Espacio entre elementos
+    int y_pos = tft.height() - 50; // Posición Y cerca del fondo
+
+    // Calcular X inicial para centrar 4 elementos
+    int total_width = (bar_width * 4) + (spacing * 3);
+    int start_x = (tft.width() - total_width) / 2;
+    
+    // Obtener cantidad actual de dígitos de forma segura
+    int digits_count = 0;
+    if (xSemaphoreTake(pinSemaphore, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+        digits_count = inputDigits.length();
+        xSemaphoreGive(pinSemaphore);
+    }
+    
+    // Dibujar los 4 indicadores
+    for (int i = 0; i < 4; i++) {
+        int x_pos = start_x + (bar_width + spacing) * i + bar_width/2;
+        
+        if (i < digits_count) {
+            // Dibujar círculo blanco para dígito ingresado
+            tft.fillCircle(x_pos, y_pos + bar_height/2, circle_radius, TFT_WHITE);
+        } else {
+            // Dibujar barra gris para posición vacía
+            int bar_x = start_x + (bar_width + spacing) * i;
+            tft.fillRect(bar_x, y_pos, bar_width, bar_height, GREY_DOTS);
+        }
+    }
+}
+
+// ===============================================
+// FUNCIÓN PARA DIBUJAR ESTADO DE VALIDACIÓN
+// ===============================================
+void drawValidationStatus() {
+    if (xSemaphoreTake(tftSemaphore, portMAX_DELAY) == pdTRUE) {
+        // Limpiar área de mensaje
+        tft.fillRect(0, 140, tft.width(), 40, TFT_BLACK);
+        
+        String message = "";
+        uint16_t color = TFT_WHITE;
+        
+        if (pinValidationInProgress) {
+            message = "Validando...";
+            color = ORANGE;
+        } else if (pinResult == SUCCESS) {
+            message = "PIN Correcto!";
+            color = GREEN;
+        } else if (pinResult == FAILED) {
+            message = "PIN Incorrecto";
+            color = RED;
+        }
+        
+        if (message.length() > 0) {
+            tft.setTextColor(color, TFT_BLACK);
+            int msgX = getCenteredX(message, 4);
+            tft.drawString(message, msgX, 150, 4);
+        }
+        
+        xSemaphoreGive(tftSemaphore);
+    }
+}
+
+// ===============================================
+// FUNCIÓN OPTIMIZADA PARA DIBUJAR FECHA Y HORA
+// ===============================================
+void drawDateTime() {
+    if (xSemaphoreTake(tftSemaphore, portMAX_DELAY) == pdTRUE) {
+        // Obtener copias seguras de las variables
+        String dayOfWeek, day, month, year, hour, minute;
+        getDateTimeValues(dayOfWeek, day, month, year, hour, minute);
+
+        // Crear strings para comparación
+        String currentTime = hour + ":" + minute;
+        String currentDate = dayOfWeek + " " + day + "," + month + " " + year;
+        
+        // Obtener cantidad de dígitos PIN para comparación
+        int currentPinDigits = 0;
+        if (xSemaphoreTake(pinSemaphore, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+            currentPinDigits = inputDigits.length();
+            xSemaphoreGive(pinSemaphore);
+        }
+
+        // Solo redibujar si algo cambió (evitar parpadeo)
+        bool needsRedraw = (currentTime != lastDisplayTime) || 
+                          (currentDate != lastDisplayDate) ||
+                          (currentPinDigits != lastPinDigitsCount);
+
+        if (needsRedraw) {
+            // Limpiar solo las áreas necesarias en lugar de toda la pantalla
+            tft.fillRect(0, 0, tft.width(), 120, TFT_BLACK); // Área de fecha/hora
+            
+            // Mostrar dia (ej. Friday 06,)
+            tft.setTextColor(currentTextColor, TFT_BLACK);
+            String formattedDay = dayOfWeek + " " + day + "," ;
+            int dayX = getCenteredX(formattedDay, 4);
+            tft.drawString(formattedDay, dayX, 7, 4);
+
+            // Mostrar mes (ej. mayo 2025)
+            String formattedMes = month + " " + year;
+            int mesX = getCenteredX(formattedMes, 4);
+            tft.drawString(formattedMes, mesX, 32, 4);
+
+            // Mostrar Hora (ej. 21:15)
+            int timeX = getCenteredX(currentTime, 8);
+            tft.drawString(currentTime, timeX, 60, 8);
+
+            // Actualizar variables de control
+            lastDisplayTime = currentTime;
+            lastDisplayDate = currentDate;
+            lastPinDigitsCount = currentPinDigits;
+        }
+        
+        // Siempre redibujar los indicadores de PIN (pueden cambiar independientemente)
+        // Limpiar área de indicadores
+        tft.fillRect(0, tft.height() - 60, tft.width(), 60, TFT_BLACK);
+        drawPinIndicators();
+        
+        // Dibujar estado de validación si es necesario
+        drawValidationStatus();
+
+        xSemaphoreGive(tftSemaphore);
+    }
+}
+
+// ===============================================
+// TAREA OPTIMIZADA PARA DISPLAY
+// ===============================================
+void DisplayTask(void *pvParameters) {
+    Serial.println("DisplayTask iniciada - Refresh optimizado");
+    for (;;) {
+        if (timer_tasks[6].flag) { // Índice 6 es para 1000ms (reducido de 500ms)
+            timer_tasks[6].flag = false; // Resetear el flag
+            drawDateTime(); // Redibuja solo si es necesario
+        }
+        vTaskDelay(20 / portTICK_PERIOD_MS); // Ceder el control
+    }
+}
+
+// ===============================================
+// FUNCIÓN PARA VALIDAR PIN EN SERVIDOR
+// ===============================================
+bool validatePinOnServer(String pin) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi no conectado para validación de PIN");
+        return false;
+    }
+
+    HTTPClient http;
+    String serverPIN_request = serverAPI_path + "AA:BB:CC:DD:EE:FF" + serverPIN_sufijo;
+    
+    Serial.println("=== VALIDACIÓN DE PIN EN SERVIDOR ===");
+    Serial.print("Conectando a: ");
+    Serial.println(serverPIN_request);
+    Serial.print("PIN a validar: ");
+    Serial.println(pin);
+
+    http.begin(serverPIN_request.c_str());
+    http.addHeader("Content-Type", "application/json");
+    http.setConnectTimeout(10000); // 10 segundos
+
+    // Crear JSON con el PIN
+    DynamicJsonDocument doc(128);
+    doc["pin"] = pin;
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    int httpResponseCode = http.POST(jsonString);
+
+    if (httpResponseCode > 0) {
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpResponseCode);
+        String payload = http.getString();
+        Serial.println(payload);
+
+        DynamicJsonDocument responseDoc(256);
+        DeserializationError error = deserializeJson(responseDoc, payload);
+
+        if (!error) {
+            bool isValid = responseDoc["valid"];
+            http.end();
+            return isValid;
+        } else {
+            Serial.print("Error parseando respuesta JSON: ");
+            Serial.println(error.f_str());
+        }
+    } else {
+        Serial.print("HTTP Error code: ");
+        Serial.println(httpResponseCode);
+    }
+    
+    http.end();
+    return false; // En caso de error, considerar PIN inválido
+}
+
+// ===============================================
+// TAREA HTTP MEJORADA CON VALIDACIÓN DE PIN
+// ===============================================
+void HTTPRequestTask(void *pvParameters) {
+    Serial.println("HTTPRequestTask iniciada - Con validación de PIN");
+    for (;;) {
+        bool processPeriodicRequest = false;
+        bool processPinValidation = false;
+        
+        // Verificar si hay PIN listo para validación (prioridad alta)
+        if (xSemaphoreTake(pinSemaphore, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+            if (pinReadyForValidation && !pinValidationInProgress) {
+                processPinValidation = true;
+                pinValidationInProgress = true;
+                pinReadyForValidation = false;
+            }
+            xSemaphoreGive(pinSemaphore);
+        }
+        
+        // Verificar timer para request periódico
+#ifdef DEBUG_20_SEC_REQUEST
+        if (timer_tasks[9].flag) { // 20 segundos para debug
+            processPeriodicRequest = true;
+            timer_tasks[9].flag = false;
+        }
+#else
+        if (timer_tasks[10].flag) { // 10 minutos para operación normal
+            processPeriodicRequest = true;
+            timer_tasks[10].flag = false;
+        }
+#endif
+
+        // Procesar validación de PIN (prioridad)
+        if (processPinValidation) {
+            httpRequestInProgress = true;
+            Serial.println("=== VALIDANDO PIN ===");
+            
+            // Obtener PIN de forma segura
+            String pinToValidate = "";
+            if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+                pinToValidate = inputDigits;
+                xSemaphoreGive(pinSemaphore);
+            }
+            
+            // Mostrar estado de validación
+            drawValidationStatus();
+            
+            // Validar en servidor
+            bool isValid = validatePinOnServer(pinToValidate);
+            
+            // Actualizar resultado
+            if (xSemaphoreTake(pinSemaphore, portMAX_DELAY) == pdTRUE) {
+                pinResult = isValid ? SUCCESS : FAILED;
+                pinValidationInProgress = false;
+                pinResultDisplayTime = millis(); // Marcar tiempo para mostrar resultado
+                xSemaphoreGive(pin
