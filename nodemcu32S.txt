@@ -654,6 +654,7 @@ bool validatePinOnServer(String pin) {
 // ===============================================
 // TAREA HTTP MEJORADA CON VALIDACIÓN DE PIN
 // ===============================================
+
 void HTTPRequestTask(void *pvParameters) {
     Serial.println("HTTPRequestTask iniciada - Con validación de PIN");
     for (;;) {
@@ -706,4 +707,524 @@ void HTTPRequestTask(void *pvParameters) {
                 pinResult = isValid ? SUCCESS : FAILED;
                 pinValidationInProgress = false;
                 pinResultDisplayTime = millis(); // Marcar tiempo para mostrar resultado
-                xSemaphoreGive(pin
+                xSemaphoreGive(pinSemaphore);
+            }
+            
+            // Actualizar display con resultado
+            drawValidationStatus();
+            
+            httpRequestInProgress = false;
+            Serial.println(isValid ? "PIN VÁLIDO" : "PIN INVÁLIDO");
+        }
+        
+        // Procesar request periódico normal
+        if (processPeriodicRequest && !httpRequestInProgress) {
+            httpRequestInProgress = true;
+            Serial.println("=== REQUEST PERIÓDICO ===");
+            
+            // Realizar request normal de fecha/hora
+            performPeriodicHTTPRequest();
+            
+            httpRequestInProgress = false;
+        }
+        
+        // Verificar si hay que limpiar PIN después de mostrar resultado
+        if (pinResult != PENDING && (millis() - pinResultDisplayTime) > PIN_RESULT_SHOW_DURATION) {
+            if (xSemaphoreTake(pinSemaphore, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+                // Limpiar PIN y resultado
+                inputDigits = "";
+                pinResult = PENDING;
+                pinValidationInProgress = false;
+                pinReadyForValidation = false;
+                Serial.println("PIN limpiado automáticamente después de mostrar resultado");
+                xSemaphoreGive(pinSemaphore);
+            }
+        }
+        
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Ceder control
+    }
+}
+
+// 2. FUNCIÓN PARA REQUEST PERIÓDICO (similar al inicial pero sin cambiar currentTextColor)
+bool performPeriodicHTTPRequest() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi no conectado para request periódico");
+        return false;
+    }
+
+    HTTPClient http;
+    String serverAPI_request = serverAPI_path + MAC_ADDRESS_STR + serverAPI_sufijo;
+    
+    Serial.println("=== REQUEST PERIÓDICO DE FECHA/HORA ===");
+    Serial.print("Conectando a: ");
+    Serial.println(serverAPI_request);
+
+    http.begin(serverAPI_request.c_str());
+    http.setConnectTimeout(10000);
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpResponseCode);
+        String payload = http.getString();
+        Serial.println(payload);
+
+        DynamicJsonDocument doc(256);
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (error) {
+            Serial.print(F("deserializeJson() failed: "));
+            Serial.println(error.f_str());
+            http.end();
+            return false;
+        } else {
+            const char* serverOK_str = doc["serverOK"];
+            if (serverOK_str) {
+                String dateTimeStr = String(serverOK_str);
+                Serial.print("Received DateTime String: ");
+                Serial.println(dateTimeStr);
+
+                int first_underscore = dateTimeStr.indexOf('_');
+                int second_underscore = dateTimeStr.indexOf('_', first_underscore + 1);
+
+                if (first_underscore != -1 && second_underscore != -1) {
+                    String newDayOfWeek = dateTimeStr.substring(0, first_underscore);
+                    String datePart = dateTimeStr.substring(first_underscore + 1, second_underscore);
+                    String timePart = dateTimeStr.substring(second_underscore + 1);
+
+                    String newDay, newMonth, newYear;
+                    int dash1 = datePart.indexOf('-');
+                    int dash2 = datePart.indexOf('-', dash1 + 1);
+                    if (dash1 != -1 && dash2 != -1) {
+                        newDay = datePart.substring(0, dash1);
+                        newMonth = datePart.substring(dash1 + 1, dash2);
+                        newYear = datePart.substring(dash2 + 1);
+                    }
+
+                    String newHour, newMinute, newSecond;
+                    int colon1 = timePart.indexOf(':');
+                    int colon2 = timePart.indexOf(':', colon1 + 1);
+                    if (colon1 != -1 && colon2 != -1) {
+                        newHour = timePart.substring(0, colon1);
+                        newMinute = timePart.substring(colon1 + 1, colon2);
+                        newSecond = timePart.substring(colon2 + 1);
+                    }
+
+                    // Actualizar las variables de forma segura
+                    setDateTimeValues(newDayOfWeek, newDay, newMonth, newYear, newHour, newMinute, newSecond);
+
+                    Serial.println("Request periódico exitoso");
+                    http.end();
+                    return true;
+                } else {
+                    Serial.println("Error parsing periodic date/time string format.");
+                    http.end();
+                    return false;
+                }
+            } else {
+                Serial.println("JSON field 'serverOK' not found in periodic request.");
+                http.end();
+                return false;
+            }
+        }
+    } else {
+        Serial.print("HTTP Error code: ");
+        Serial.println(httpResponseCode);
+        http.end();
+        return false;
+    }
+}
+
+// 3. FUNCIÓN performInitialHTTPRequest() CORREGIDA (usar MAC real)
+bool performInitialHTTPRequest() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi no conectado para request inicial");
+        currentTextColor = RED;
+        return false;
+    }
+
+    HTTPClient http;
+    // CORREGIDO: Usar MAC_ADDRESS_STR en lugar de MAC hardcodeado
+    String serverAPI_request = serverAPI_path + MAC_ADDRESS_STR + serverAPI_sufijo;
+    
+    Serial.println("=== REQUEST INICIAL DE FECHA/HORA ===");
+    Serial.print("Conectando a: ");
+    Serial.println(serverAPI_request);
+
+    http.begin(serverAPI_request.c_str());
+    http.setConnectTimeout(10000);
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpResponseCode);
+        String payload = http.getString();
+        Serial.println(payload);
+
+        DynamicJsonDocument doc(256);
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (error) {
+            Serial.print(F("deserializeJson() failed: "));
+            Serial.println(error.f_str());
+            http.end();
+            currentTextColor = RED;
+            return false;
+        } else {
+            const char* serverOK_str = doc["serverOK"];
+            if (serverOK_str) {
+                String dateTimeStr = String(serverOK_str);
+                Serial.print("Received DateTime String: ");
+                Serial.println(dateTimeStr);
+
+                int first_underscore = dateTimeStr.indexOf('_');
+                int second_underscore = dateTimeStr.indexOf('_', first_underscore + 1);
+
+                if (first_underscore != -1 && second_underscore != -1) {
+                    String newDayOfWeek = dateTimeStr.substring(0, first_underscore);
+                    String datePart = dateTimeStr.substring(first_underscore + 1, second_underscore);
+                    String timePart = dateTimeStr.substring(second_underscore + 1);
+
+                    String newDay, newMonth, newYear;
+                    int dash1 = datePart.indexOf('-');
+                    int dash2 = datePart.indexOf('-', dash1 + 1);
+                    if (dash1 != -1 && dash2 != -1) {
+                        newDay = datePart.substring(0, dash1);
+                        newMonth = datePart.substring(dash1 + 1, dash2);
+                        newYear = datePart.substring(dash2 + 1);
+                    }
+
+                    String newHour, newMinute, newSecond;
+                    int colon1 = timePart.indexOf(':');
+                    int colon2 = timePart.indexOf(':', colon1 + 1);
+                    if (colon1 != -1 && colon2 != -1) {
+                        newHour = timePart.substring(0, colon1);
+                        newMinute = timePart.substring(colon1 + 1, colon2);
+                        newSecond = timePart.substring(colon2 + 1);
+                    }
+
+                    setDateTimeValues(newDayOfWeek, newDay, newMonth, newYear, newHour, newMinute, newSecond);
+                    currentTextColor = TEXT_COLOR;
+
+                    Serial.println("=== DATOS INICIALES OBTENIDOS ===");
+                    Serial.print("Day of Week: "); Serial.println(newDayOfWeek);
+                    Serial.print("Day: "); Serial.println(newDay);
+                    Serial.print("Month: "); Serial.println(newMonth);
+                    Serial.print("Year: "); Serial.println(newYear);
+                    Serial.print("Hour: "); Serial.println(newHour);
+                    Serial.print("Minute: "); Serial.println(newMinute);
+                    Serial.print("Second: "); Serial.println(newSecond);
+                    Serial.println("================================");
+
+                    http.end();
+                    return true;
+                } else {
+                    Serial.println("Error parsing initial date/time string format.");
+                    http.end();
+                    currentTextColor = RED;
+                    return false;
+                }
+            } else {
+                Serial.println("JSON field 'serverOK' not found in initial request.");
+                http.end();
+                currentTextColor = RED;
+                return false;
+            }
+        }
+    } else {
+        Serial.print("HTTP Error code: ");
+        Serial.println(httpResponseCode);
+        http.end();
+        currentTextColor = RED;
+        return false;
+    }
+}
+
+// 4. SETUP() CORREGIDO - Agregar semáforos faltantes
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+
+    // Configuración explícita de pines
+    for(int i = 0; i < ROWS; i++) {
+        pinMode(rowPins[i], INPUT_PULLUP);
+    }
+    for(int i = 0; i < COLS; i++) {
+        pinMode(colPins[i], OUTPUT);
+        digitalWrite(colPins[i], HIGH);
+    }
+  
+    pinMode(ONBOARD_LED, OUTPUT);
+    pinMode(BUZZER, OUTPUT);
+
+    MAC_ADDRESS_STR = getMACAddress();
+    MAC_ADDRESS_STR.toUpperCase();
+    Serial.print("MAC Address: ");
+    Serial.println(MAC_ADDRESS_STR);
+
+    start_connecting_fer();
+
+    Serial.println("Iniciando configuración TFT...");
+    tft.begin();
+    tft.init();
+    tft.setRotation(3);
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("IP: ", 5, 5, 4);
+    tft.drawString(IP_ADDRESS, 40, 5, 4);
+    delay(3000);
+
+    // Crear TODOS los semáforos ANTES de usarlos
+    semaforoTimerFlags = xSemaphoreCreateBinary();
+    if (semaforoTimerFlags == NULL) {
+        Serial.println("Error semáforo flags!");
+        ESP.restart();
+    }
+    xSemaphoreGive(semaforoTimerFlags);
+
+    tftSemaphore = xSemaphoreCreateMutex();
+    if (tftSemaphore == NULL) {
+        Serial.println("Error creando mutex TFT!");
+        ESP.restart();
+    }
+
+    dateTimeSemaphore = xSemaphoreCreateMutex();
+    if (dateTimeSemaphore == NULL) {
+        Serial.println("Error creando mutex DateTime!");
+        ESP.restart();
+    }
+
+    // AGREGAR: Crear semáforos para teclado y PIN
+    keypadSemaphore = xSemaphoreCreateMutex();
+    if (keypadSemaphore == NULL) {
+        Serial.println("Error creando mutex Keypad!");
+        ESP.restart();
+    }
+
+    pinSemaphore = xSemaphoreCreateMutex();
+    if (pinSemaphore == NULL) {
+        Serial.println("Error creando mutex PIN!");
+        ESP.restart();
+    }
+
+    // Mostrar mensaje de "Obteniendo hora..."
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    int loadingX = getCenteredX("Obteniendo hora...", 4);
+    tft.drawString("Obteniendo hora...", loadingX, 100, 4);
+
+    // Realizar request inicial de fecha/hora
+    bool initialRequestSuccess = performInitialHTTPRequest();
+    
+    if (!initialRequestSuccess) {
+        Serial.println("Fallo en request inicial, continuando con valores por defecto");
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(RED, TFT_BLACK);
+        int errorX = getCenteredX("Error obteniendo hora", 4);
+        tft.drawString("Error obteniendo hora", errorX, 100, 4);
+        delay(2000);
+    } else {
+        Serial.println("Request inicial exitoso, mostrando datos obtenidos");
+    }
+
+    // Configurar timer después de obtener datos iniciales
+    esp_timer_create_args_t timer_args = {
+        .callback = &espTimerCallback,
+        .arg = NULL,
+        .name = "flags_timer"
+    };
+
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &esp_timer_flags_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(esp_timer_flags_handle, 1000)); // 1ms
+
+    Serial.println("Timer Flags (1ms) configurado con esp_timer.");
+    Serial.printf("Número de tareas de temporizador configuradas: %d\n", num_timer_tasks);
+
+    // Crear TODAS las tareas incluyendo KeypadTask
+    xTaskCreatePinnedToCore(
+        KeypadTask,        // AGREGAR: Tarea de teclado
+        "KeypadTask",
+        4096,
+        NULL,
+        3,                 // Prioridad alta para teclado
+        NULL,
+        0
+    );
+
+    xTaskCreatePinnedToCore(
+        DisplayTask,
+        "DisplayTask",
+        4096,
+        NULL,
+        2,
+        NULL,
+        1
+    );
+
+    xTaskCreatePinnedToCore(
+        HTTPRequestTask,
+        "HTTPRequestTask",
+        8192,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+
+    Serial.println("Setup completado, mostrando datos iniciales...");
+    drawDateTime(); // Dibuja con los datos obtenidos
+}
+
+// 5. LOOP() CORREGIDO - Eliminar lectura de teclado (ya la maneja KeypadTask)
+void loop() {
+    // ELIMINAR: Ya no necesitamos leer teclado aquí
+    // KEY = keypad.getKey();
+    // if (KEY) {
+    //     Serial.printf("Tecla presionada: %c\n", KEY);    
+    // }
+    
+    if (xSemaphoreTake(semaforoTimerFlags, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < num_timer_tasks; i++) {
+            // Procesar todos los flags excepto los que manejan las tareas dedicadas
+            if (i != 6 && i != 9 && i != 10) { // Excluir display task y HTTP request tasks
+                if (timer_tasks[i].flag) {
+                    uint32_t interval = timer_tasks[i].interval_ms;
+
+                    if (interval == 100) {
+                        digitalWrite(BUZZER, LOW);
+                    } else if (interval == 500) {
+                        estadoLed = !estadoLed;
+                        digitalWrite(ONBOARD_LED, estadoLed);
+                        // Serial.println("LED toggle - 500ms timer"); // Comentar para reducir logs
+                    } else if (interval == 5000) {
+                        Serial.println("timer 5Seg - (managed by main loop)");
+                    }
+                    timer_tasks[i].flag = false;
+                }
+            }
+        }
+    }
+}
+
+
+
+/*
+2. Sistema de Almacenamiento de Dígitos
+Necesitas crear:
+
+Una variable global String inputDigits = "" (máximo 4 caracteres)
+Una función addDigit(char digit) que:
+
+Valide que sea un dígito (0-9)
+Solo agregue si inputDigits.length() < 4
+Actualice el display inmediatamente
+Si llega a 4 dígitos, active un flag para HTTP request
+
+
+
+3. Visualización de Dígitos Enmascarados
+Modificar la función drawDateTime():
+
+Reemplazar las 4 barras azules por círculos según inputDigits.length()
+Círculos llenos blancos para dígitos ingresados
+Barras grises para posiciones vacías
+Usar tft.fillCircle(x, y, radio, TFT_WHITE) para los círculos
+
+4. Sistema de Request por PIN
+Crear nueva lógica:
+
+Flag bool pinReadyForValidation = false
+Cuando inputDigits.length() == 4, activar este flag
+En HTTPRequestTask, verificar este flag antes que los timers
+Crear endpoint específico para validación de PIN
+Limpiar inputDigits después del request (exitoso o fallido)
+
+5. Solución al Parpadeo del Display
+El parpadeo se debe a:
+
+tft.fillScreen(TFT_BLACK) borra toda la pantalla antes de redibujar
+Frecuencia de 500ms es muy alta para un reloj
+
+Soluciones:
+
+Refresh selectivo: Solo redibujar las partes que cambiaron
+Double buffering conceptual: Comparar valores antiguos vs nuevos
+Reducir frecuencia: Cambiar a 1000ms para el reloj, pero mantener refresh inmediato para los círculos de PIN
+Optimizar SPI: Aumentar velocidad del SPI en la configuración de TFT_eSPI
+
+6. Arquitectura Mejorada de Tareas
+Modificaciones sugeridas:
+
+KeypadTask: Solo lectura y procesamiento de teclas
+DisplayTask: Dividir en dos funciones: updateClock() y updatePinDisplay()
+HTTPRequestTask: Manejar tanto requests periódicos como validación de PIN
+Añadir PinValidationTask: Específica para manejar el flujo de validación
+
+7. Variables y Estados Adicionales
+agregar variables necesarias:
+
+8. Flujo de Validación de PIN
+Secuencia propuesta:
+
+Usuario ingresa dígitos → se muestran círculos
+Al 4to dígito → request inmediato al servidor
+Durante validación → mostrar indicador de "procesando"
+Resultado → mostrar éxito (verde) o error (rojo) por 2-3 segundos
+Limpiar PIN y volver al display normal
+
+9. Optimizaciones de Rendimiento
+Para el SPI y display:
+
+Verificar configuración de velocidad en User_Setup.h de TFT_eSPI
+Usar tft.setSwapBytes(true) si es necesario
+Implementar dirty flags para solo redibujar elementos modificados
+
+Para el sistema general:
+
+Reducir stack size de tareas no críticas
+Usar vTaskDelayUntil() en lugar de vTaskDelay() para timing preciso
+Considerar usar interrupciones GPIO para el teclado en lugar de polling
+
+//==============================================================================================
+Principales Correcciones y Completado:
+1. HTTPRequestTask Completada
+
+Terminé la función que se cortó
+Agregué manejo de limpieza automática del PIN después de mostrar resultado por 3 segundos
+Separé request periódico del de validación de PIN
+
+2. Setup() Corregido
+
+CRÍTICO: Agregué la creación de keypadSemaphore y pinSemaphore (estaban faltando)
+Agregué la creación de KeypadTask que no estaba en tu setup original
+Corregí el uso de MAC real en lugar del hardcodeado "AA:BB:CC:DD:EE:FF"
+
+3. Loop() Optimizado
+
+Eliminé la lectura redundante del teclado - ahora solo la maneja KeypadTask
+Corregí los índices de exclusión de timers
+Comenté el log del LED para reducir ruido en consola
+
+4. Nuevas Funciones Agregadas
+
+performPeriodicHTTPRequest() - Para requests normales sin afectar currentTextColor
+Lógica de limpieza automática del PIN
+
+5. Funcionalidad del Sistema PIN
+
+Dígitos 0-9: Se agregan al PIN y muestran círculos
+Tecla C: Limpia todo el PIN
+**Tecla ***: Borra último dígito
+Tecla #: Fuerza validación (rellena con ceros si es necesario)
+4 dígitos: Validación automática
+Resultado: Se muestra por 3 segundos y luego se limpia automáticamente
+
+6. Optimizaciones Implementadas
+
+Teclado independiente que no se bloquea durante HTTP requests
+Display solo se redibuja cuando hay cambios (elimina parpadeo)
+Semáforos para proteger todas las variables compartidas
+Gestión inteligente de estados de PIN
+*/
